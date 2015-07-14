@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import argparse
 import dateutil.parser
 import numpy as np
+import scipy.optimize as opt
 import sys
 
 from peregrine.gps_time import datetime_to_tow
@@ -34,6 +35,143 @@ def mags(x):
     ''' Get the magnitudes of the XYZ position, velocity and jerk '''
     return np.linalg.norm(x, axis=1)
 
+def smoothify(traj0, traj1):
+    '''Given two trajectory rows [time, pos, vel, acc, jerk], return more
+    rows to be inserted between them such that the resulting trajectory
+    is smooth in position, velocity and acceleration.
+    '''
+    # We'll choose three points at times equally spaced between the boundary conditions
+    n_new_pts = 3
+
+    def fit3(t_event, t_ramp):
+        traj = np.vstack([traj0, np.zeros((n_new_pts, 13)), traj1])
+        # Choose the times
+        traj[1, 0] = t_event - t_ramp
+        traj[2, 0] = t_event
+        traj[3, 0] = t_event + t_ramp
+        dt = np.diff(traj[:, 0])
+        # Transition from one point to the next via kinematic integration:
+        # x1 = Ax0 + Bj0
+        # x2 = Ax1 + Bj1
+        #    = AAx0 + ABj0 + Bj1
+        # ...
+        # x4 = AAAAx0 + AAABj0 + AABj1 + ABj2 + Bj3
+        # where x is the pos/vel/acc state, j is the chosen jerk
+
+        A = lambda dt: np.array([[1, dt, dt**2 / 2],
+                                 [0, 1, dt],
+                                 [0, 0, 1]])
+        B = lambda dt: np.array([dt**3 / 6,
+                                 dt**2 / 2,
+                                 dt])
+        # Solving for j1, j2, j3:
+        #   x4 - AAAAx0 - AAABj0 = AABj1 + ABj2 + Bj3
+        # or
+        #   Q = RJ
+        # where
+        # J = [j1, j2, j3]
+
+        # print "traj0: ", traj0
+        # print "pvaj(traj0): ", pvaj(traj0)
+        for spatial_axis in range(3):
+            # print "%s axis" % ("XYZ"[spatial_axis])
+            x0 = pvaj(traj[0])[0:3,spatial_axis]
+            # print "x0 = " + str(x0)
+            x4 = pvaj(traj[4])[0:3,spatial_axis]
+            # print "x4 = " + str(x4)
+            j0 = pvaj(traj[0])[3,spatial_axis]
+            # print "j0 = ", j0
+            Q = x4 - A(dt[3]).dot(A(dt[2])).dot(A(dt[1])).dot(A(dt[0])).dot(x0) - A(dt[3]).dot(A(dt[2])).dot(A(dt[1])).dot(B(dt[0])) * j0
+            R = np.array([
+                A(dt[3]).dot(A(dt[2])).dot(B(dt[1])),
+                A(dt[3]).dot(B(dt[2])),
+                B(dt[3])]).T
+            # print "R = ", R
+            J = np.linalg.inv(R).dot(Q)
+            # print "J = ", J
+            x1 = A(dt[0]).dot(x0) + B(dt[0]) * j0
+            x2 = A(dt[1]).dot(x1) + B(dt[1]) * J[0]
+            x3 = A(dt[2]).dot(x2) + B(dt[2]) * J[1]
+            x4_p = A(dt[3]).dot(x3) + B(dt[3]) * J[2]
+
+#            print "LHS = ", Q
+#            print "RHS = ", A.dot(A).dot(B).dot(J[0]) + A.dot(B).dot(J[1]) + B.dot(J[2])
+#            print "RJ = ", R.dot(J)
+            # print "x4_p - x4:" , x4_p - x4
+
+            if np.linalg.norm(x4_p - x4) > 1e-5:
+                raise ValueError("Residual too large")
+            
+            traj[1][1 + 3 * 0 + spatial_axis] = x1[0]
+            traj[1][1 + 3 * 1 + spatial_axis] = x1[1]
+            traj[1][1 + 3 * 2 + spatial_axis] = x1[2]
+            traj[1][1 + 3 * 3 + spatial_axis] = J[0]
+            
+            traj[2][1 + 3 * 0 + spatial_axis] = x2[0]
+            traj[2][1 + 3 * 1 + spatial_axis] = x2[1]
+            traj[2][1 + 3 * 2 + spatial_axis] = x2[2]
+            traj[2][1 + 3 * 3 + spatial_axis] = J[1]
+            
+            traj[3][1 + 3 * 0 + spatial_axis] = x3[0]
+            traj[3][1 + 3 * 1 + spatial_axis] = x3[1]
+            traj[3][1 + 3 * 2 + spatial_axis] = x3[2]
+            traj[3][1 + 3 * 3 + spatial_axis] = J[2]
+
+        return traj
+
+    DT = traj1[0] - traj0[0]
+    t_min = 1e-5
+
+    if 0:
+        def cost(x):
+            print "Cost(%.12f, %.12f)" % (x[0], x[1])
+            t_event = traj0[0] + DT * x[0]
+            t_ramp = DT * x[1]
+            traj = fit3(t_event, t_ramp)
+            excess_accel = (traj[1:4,:] - traj[0,:])[:, 7:10]  # 3x3
+            c = np.sum(excess_accel ** 2)
+            print " = ", c
+            return c
+
+        x_guess = [0.5, 0.25]
+        cons = ({'type': 'ineq', 'fun': lambda x:  x[0] - x[1]},    # Lower bound
+                {'type': 'ineq', 'fun': lambda x:  1-(x[0] + x[1])}) # Upper bound
+        bnds = [(2*t_min, 1-2*t_min), (t_min, 0.5-t_min)]
+    else:
+        t_ramp = 1e-2 * DT
+        def cost(x):
+            print "Cost(%.12f)" % (x[0])
+            t_event = traj0[0] + DT * x[0]
+            traj = fit3(t_event, t_ramp)
+    #        print traj
+            excess_accel = (traj[1:4,:] - traj[0,:])[:, 7:10]  # 3x3
+            print 'Traj:'
+            print traj
+            print 'Excess accel:'
+            print excess_accel
+            c = np.sum(excess_accel ** 2)
+            print "c = ", c
+            return c
+        x_guess = [0.5]
+        bnds = [(t_min + t_ramp / DT, 1-(t_min + t_ramp/DT))]
+        cons = []
+        
+    result = opt.minimize(cost, x_guess, bounds=bnds, constraints=cons, options={'disp': True})
+    print result
+    t_event = traj0[0] + DT * result.x[0]
+#    t_ramp = DT * result.x[1]
+    traj = fit3(t_event, t_ramp)
+    
+    print 
+    print traj[0]
+    print traj[1]
+    print traj[2]
+    print traj[3]
+    print traj[4]
+    print
+#    raise ValueError("how does this look?")
+    return [traj[1], traj[2], traj[3]]
+
 def check_smooth(traj, tol=[0.010, 0.1, 10], repair=False, verbose=True):
     '''Check that the position, velocity and acceleration terms
     in a trajectory are smooth to within some tolerance.
@@ -55,28 +193,7 @@ def check_smooth(traj, tol=[0.010, 0.1, 10], repair=False, verbose=True):
                     print dx[axis]
                 smooth = False
                 if repair:
-                    # Compute a new point in between the two previous points such that
-                    # the position and velocity are smooth
-                    dtA = 0.000
-                    dtB = dt - dtA
-                    new_pvaj = integrate_state(x0, dtA)
-                    for axis in range(3):
-                        p0 = new_pvaj[0][axis]
-                        p1 = pvaj(this_pt)[0][axis]
-                        v0 = new_pvaj[1][axis]
-                        v1 = pvaj(this_pt)[1][axis]
-                        j0 = ((dtB/2)*(v1+v0)-p1+p0) / ((dtB)**3 / 12)
-                        a0 = (v1-v0)/(dtB) - (dtB/2) * j0
-                        new_pvaj[2][axis] = a0
-                        new_pvaj[3][axis] = j0
-
-                    new_pt = np.concatenate([[traj[i-1][0] + dtA],
-                                             new_pvaj[0],
-                                             new_pvaj[1],
-                                             new_pvaj[2],
-                                             new_pvaj[3]])
-                    traj_new.pop()
-                    traj_new.append(new_pt)
+                    traj_new += smoothify(traj[i-1], this_pt)
         traj_new.append(this_pt)
     return np.array(traj_new), smooth
 
