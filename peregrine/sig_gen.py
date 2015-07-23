@@ -560,12 +560,15 @@ def main():
     if args.prns:
         prns = [int(p) - 1 for p in args.prns.split(',')]
     else:
-        [x,y,z] = interp_pv(traj, args.t_start)[0]
-        [lat,lon,h] = coord.wgsecef2llh(x,y,z)
-        print "Finding satellites visible above %.2f, %.2f, %.0f on %s" % (
-            np.degrees(lat), np.degrees(lon), h,
-            gpst0 + timedelta(seconds=args.t_start))
-        prns = peregrine.warm_start.whatsup(ephems, [x,y,z], gpst0, mask=10)
+        prns = []
+        for t in [args.t_start, args.t_start+args.t_run]:
+            [x,y,z] = interp_pv(traj, t)[0]
+            [lat,lon,h] = coord.wgsecef2llh(x,y,z)
+            print "Finding satellites visible above %.2f, %.2f, %.0f on %s" % (
+                np.degrees(lat), np.degrees(lon), h,
+                gpst0 + timedelta(seconds=t))
+            prns += [p for p in peregrine.warm_start.whatsup(
+                ephems, [x,y,z], gpst0, mask=5) if p not in prns]
     print "Using PRNs:", [p + 1 for p in prns]
 
     print "Generating samples..."
