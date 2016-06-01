@@ -46,8 +46,12 @@ def check_smooth(traj, tol=[0.010, 0.1, 10]):
         dx = pvaj(traj[i]) - x1
         for axis, desc in enumerate(["Position", "Velocity", "Acceleration"]):
             if np.any(np.abs(dx[axis]) > tol[axis]):
-                print "%s discontinuity at row %d, time %.3f:" % (
-                desc, i, traj[i][0])
+		t = traj[i][0]
+		hh = int(t / 3600)
+		mm = int((t - hh * 3600) / 60)
+		ss = int(t % 60) 
+                print "%s discontinuity at row %d, time %.3f (%02d:%02d:%02d):" % (
+                desc, i, t, hh, mm, ss)
                 print dx[axis]
                 smooth = False
     return smooth
