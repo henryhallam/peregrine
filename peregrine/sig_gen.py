@@ -350,7 +350,11 @@ def gen_signal(ephems, traj,
                t0, t_run, t_skip=0, t_step=0.002,
                fs=16.368e6, fi=4.092e6,
                snr=1, jitter=0,
-               prns=range(1), scale=16, repair_unsmooth=True):
+               prns=range(1), scale=16, repair_unsmooth=True,
+               multipath_spec=(0,0,0)):
+    
+    (multipath_n, multipath_x, multipath_y) = multipath_spec
+    multipath_prns = prns[0:multipath_n]
 
     step_t, step_tow, step_pv, step_samps = \
         interp_traj(traj, t0, t_run, t_skip, t_step, fs,
@@ -368,7 +372,20 @@ def gen_signal(ephems, traj,
         for ix in range(i, i + n):
             def gen_signal_step_sat(prn):
                 x, v = sat_los(step_tow[ix], step_pv[ix], ephems[prn])
-                return gen_signal_sat_los(step_tow[ix], x, v, step_samps, fs, fi, cacodes[prn], nav_msgs[prn], nav_msg_tow0, jitter) * step_prn_snrs[ix][prn]
+                s_direct = gen_signal_sat_los(step_tow[ix], x, v, step_samps, fs, fi, cacodes[prn], nav_msgs[prn], nav_msg_tow0, jitter) * step_prn_snrs[ix][prn]
+                if prn not in multipath_prns:
+                    return s_direct
+                else:
+		    mp_offset_v = multipath_x
+                    mp_offset = ((step_tow[ix] - step_tow[0]) - 90) * mp_offset_v
+		
+                    if mp_offset < 0:
+                        return s_direct
+                    s_indirect = multipath_y * gen_signal_sat_los(step_tow[ix],
+                                                                  x + mp_offset, v + mp_offset_v, step_samps, fs, fi,
+                                                                  cacodes[prn], nav_msgs[prn],
+                                                                  nav_msg_tow0, jitter) * step_prn_snrs[ix][prn]
+                    return s_direct + s_indirect
             sp = map(lambda prn: gen_signal_step_sat(prn), step_prn_snrs[ix].keys())
             s = np.sum(sp,0)# + np.random.normal(size=step_samps)
             s = np.int8(s * scale)
@@ -409,7 +426,7 @@ def main():
                        help="Run length (seconds)")
     parser.add_argument("-t", dest="t_step", default=0.004, type=float,
                         help="Time step (seconds, default: %(default).3f)")
-    parser.add_argument("-g", dest="gps_time", default="2015-05-25 00:00:00",
+    parser.add_argument("-g", dest="gps_time", default="2016-07-11 00:00:00",
                        help="GPS time referred to trajectory zero time "
                        '(default: "%(default)s")')
     parser.add_argument("-n", dest="noise", type=int,
@@ -424,6 +441,8 @@ def main():
                        help="Sampling rate (default: %(default).0f)")
     parser.add_argument("-p", dest="prns",
                        help="Comma-separated 1-indexed PRNs to simulate (default: autoselect)")
+    parser.add_argument("-m", dest="multipath",
+                        help="N,X,Y Add artifical multipath on first N PRNs after 90 sec at X m/s and Y fractional amplitude")
     parser.add_argument("-v", dest="verbose", action='store_true',
                        help="Increase verbosity")
     args = parser.parse_args()
@@ -444,7 +463,18 @@ def main():
         traj.resize(1,13)  # Pad any unspecified values with zeros
         print "Using Taylor trajectory:"
         print pvaj(traj[0])
+        args.repair = False
 
+    if args.multipath:
+        multipath_spec = args.multipath.split(',')
+        multipath_n = int(multipath_spec[0])
+        multipath_x = float(multipath_spec[1])
+        multipath_y = float(multipath_spec[2])
+    else:
+        multipath_n = 0
+        multipath_x = 0
+        multipath_y = 0
+        
     if not args.t_run:
         args.t_run = max(traj[-1][0] - args.t_start, 60)
         print "Run length not specified; using %.1f seconds" % args.t_run
@@ -464,11 +494,17 @@ def main():
             gpst0 + timedelta(seconds=args.t_start))
         prns = peregrine.warm_start.whatsup(ephems, [x,y,z], gpst0, mask=10)
     print "Using PRNs:", [p + 1 for p in prns]
+    for prn in prns:
+	wk, tow = datetime_to_tow(gpst0)
+        pos, _, _, _ = eph.calc_sat_pos(ephems[prn], tow, wk, warn_stale = False)
+        az, el = coord.wgsecef2azel(pos, interp_pv(traj, args.t_start)[0])
+	print "PRN%02d: Az=%.0f, El=%.0f" % (prn+1, np.degrees(az), np.degrees(el))
 
     print "Generating samples..."
     s = gen_signal(ephems, traj, gpst0, repair_unsmooth=args.repair,
                    t_run=args.t_run, t_skip=args.t_start, t_step=args.t_step,
-                   fs=args.fs, fi=args.fi, prns=prns)
+                   fs=args.fs, fi=args.fi, prns=prns,
+                   multipath_spec=(multipath_n, multipath_x, multipath_y))
     
     if args.noise:
         print "Adding noise..."
