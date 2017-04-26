@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import argparse
 import dateutil.parser
 import numpy as np
+import math
 import sys
 
 from peregrine.gps_time import datetime_to_tow
@@ -101,6 +102,8 @@ def plot_traj(traj):
 def interp_pv(traj, t, smoothify=False):
     # Find the entry in the trajectory table just preceding t
     idx = max(0, np.argmax(traj[:,0] > t) - 1)
+    if t >= traj[-1,0]:
+        idx = len(traj)-1
     x0 = pvaj(traj[idx])
     t0 = traj[idx][0]
     # Extrapolate from there
@@ -121,6 +124,8 @@ def interp_pv(traj, t, smoothify=False):
 def interp_p(traj, t, causal=True):
     # Find the entry in the trajectory table just preceding t
     idx = max(0, np.argmax(traj[:,0] > t) - 1)
+    if t >= traj[-1,0]:
+        idx = len(traj)-1
     x0 = pvaj(traj[idx])
     t0 = traj[idx][0]
     # Extrapolate from there
@@ -156,7 +161,7 @@ def interp_traj(traj, t0, t_run, t_skip=0, t_step=0.002, fs=16.368e6, smoothify=
     return step_t, step_tow, step_pv, step_samps
 
 def gen_signal_sat_los(t0, x0, v, n_samples, fs, fi, cacode, nav_msg, nav_msg_tow0, jitter=0):
-    t = t0 + np.arange(n_samples) / fs # + np.random.normal(size=n_samples)*jitter
+    t = t0 + np.arange(n_samples, dtype=np.float32) / fs # + np.random.normal(size=n_samples)*jitter
     x = x0 + (t-t0) * v
     carrier_phase = 2 * gps.pi * ((fi * t) - (x / (gps.c / gps.l1)))
     code_phase = np.asarray((t * gps.chip_rate) - x / (gps.c / gps.chip_rate), np.int64)
@@ -346,20 +351,83 @@ def gen_nav_msg(ephem, tow0, n_subframes=5*25):
 
     return np.array(bits)
 
+def rotation_matrix(axis, theta):
+    """
+    Return the rotation matrix associated with counterclockwise rotation about
+    the given axis by theta radians.
+    """
+    axis = np.asarray(axis)
+    axis = axis/math.sqrt(np.dot(axis, axis))
+    a = math.cos(theta/2.0)
+    b, c, d = -axis*math.sin(theta/2.0)
+    aa, bb, cc, dd = a*a, b*b, c*c, d*d
+    bc, ad, ac, ab, bd, cd = b*c, a*d, a*c, a*b, b*d, c*d
+    return np.array([[aa+bb-cc-dd, 2*(bc+ad), 2*(bd-ac)],
+                     [2*(bc-ad), aa+cc-bb-dd, 2*(cd+ab)],
+                     [2*(bd+ac), 2*(cd-ab), aa+dd-bb-cc]])
+
+def gen_snrs(step_t, step_tow, step_pv, prns, ephems, blackout_spec, antenna, elev_mask):
+    # Apply elevation mask, blackout, and antenna model to find the SNRs for each timestep
+
+    if blackout_spec:
+        (blackout_start, blackout_dur, blackout_fade, blackout_level) = blackout_spec
+
+    # Start with no signals
+    snrs = [{p: 0.0 for p in prns} for t in step_t]
+
+    for (ix, t) in enumerate(step_t):
+        rx_pos = step_pv[ix][0]
+        rx_vel = step_pv[ix][1]
+        rbar = rx_pos / np.linalg.norm(rx_pos)
+        vbar = rx_vel / np.linalg.norm(rx_vel)
+        antenna_normal = np.dot(rbar, rotation_matrix(vbar, np.radians(antenna)))
+        if blackout_spec:
+            if t < blackout_start or t > blackout_start + blackout_dur:
+                blackout_scale = 1.0
+            elif t < blackout_start + blackout_fade:
+                blackout_scale = 1.0 - (1.0 - blackout_level) * ((t - blackout_start) / blackout_fade)
+            elif t < blackout_start + blackout_dur - blackout_fade:
+                blackout_scale = blackout_level
+            else:
+                blackout_scale = blackout_level + (1.0 - blackout_level) * ((t - (blackout_start + blackout_dur - blackout_fade)) / blackout_fade)
+        else:
+            blackout_scale = 1.0
+                
+        for prn in prns:
+            # Is sat above horizon?
+            sat_pos, _, _, _ = eph.calc_sat_pos(ephems[prn], step_tow[ix], week = None,
+                                                      warn_stale = False)
+            az, el = coord.wgsecef2azel(sat_pos, rx_pos)
+            if np.degrees(el) > elev_mask:
+                # Is sat visible to antenna?
+                satbar = sat_pos - rx_pos
+                satbar /= np.linalg.norm(satbar)
+                ant_angle = np.degrees(np.arccos(np.clip(np.dot(satbar, antenna_normal),-1.0,1.0)))
+                # Quick-n-dirty antenna model: flat gain to 60 deg off-axis, then fade to 0 @ 90 deg
+                if ant_angle < 60.0:
+                    snrs[ix][prn] = blackout_scale
+                elif ant_angle < 90.0:
+                    snrs[ix][prn] = blackout_scale * (1.0 - (ant_angle - 60.0) / 30.0)
+                else:
+                    snrs[ix][prn] = 0.0
+#    return [{p: 1.0 for p in prns} for t in step_t]
+    return snrs
+
 def gen_signal(ephems, traj,
                t0, t_run, t_skip=0, t_step=0.002,
                fs=16.368e6, fi=4.092e6,
-               snr=1, jitter=0,
+               jitter=0,
                prns=range(1), scale=16, repair_unsmooth=True,
-               multipath_spec=(0,0,0)):
-    
+               multipath_spec=(0,0,0), blackout_spec=None, antenna=0.0, elev_mask=5.0):
+
+    print "Calculating preliminary trajectory info..."
     (multipath_n, multipath_x, multipath_y) = multipath_spec
     multipath_prns = prns[0:multipath_n]
 
     step_t, step_tow, step_pv, step_samps = \
         interp_traj(traj, t0, t_run, t_skip, t_step, fs,
                     smoothify=repair_unsmooth)
-    step_prn_snrs = [{p: snr for p in prns} for t in step_t]
+    step_prn_snrs = gen_snrs(step_t, step_tow, step_pv, prns, ephems, blackout_spec, antenna, elev_mask)
     np.random.seed(222)
     nav_msg_tow0 = int(step_tow[0] / (5*6)) * 5*6 # Round to beginning of 30-second nav msg cycle
     nav_msgs = {prn: gen_nav_msg(ephems[prn], nav_msg_tow0) for prn in prns}
@@ -371,6 +439,8 @@ def gen_signal(ephems, traj,
         ss = []
         for ix in range(i, i + n):
             def gen_signal_step_sat(prn):
+                if (step_prn_snrs[ix][prn] == 0.0):
+                    return np.zeros(step_samps)
                 x, v = sat_los(step_tow[ix], step_pv[ix], ephems[prn])
                 s_direct = gen_signal_sat_los(step_tow[ix], x, v, step_samps, fs, fi, cacodes[prn], nav_msgs[prn], nav_msg_tow0, jitter) * step_prn_snrs[ix][prn]
                 if prn not in multipath_prns:
@@ -389,12 +459,17 @@ def gen_signal(ephems, traj,
             sp = map(lambda prn: gen_signal_step_sat(prn), step_prn_snrs[ix].keys())
             s = np.sum(sp,0)# + np.random.normal(size=step_samps)
             s = np.int8(s * scale)
+            if i == 0:
+                print s
             ss.append(s)
         return np.concatenate(ss)
     
+    print "Generating samples..."
     sss = pp.parmap(lambda i: gen_chunk(i, min(chunk_len, len(step_t)-i)),
                     range(0, len(step_t), chunk_len))
     return np.concatenate(sss)
+#    return sss
+
 
 def add_noise(s, level):
     rem = len(s)
@@ -443,6 +518,12 @@ def main():
                        help="Comma-separated 1-indexed PRNs to simulate (default: autoselect)")
     parser.add_argument("-m", dest="multipath",
                         help="N,X,Y Add artifical multipath on first N PRNs after 90 sec at X m/s and Y fractional amplitude")
+    parser.add_argument("-b", dest="blackout",
+                        help="T0,dT[,TF[,L]] Blackout at T0 (referred to first row in UMT, not t_start) for duration dT seconds. Fade signal to 0 amplitude (or L) over TF.")
+    parser.add_argument("-a", dest="antenna", default=0.0, type=float,
+                        help="antenna off-zenith roll angle, degrees (signed)")
+    parser.add_argument("-M", dest="mask", default = 5.0,
+                        help="elevation mask, degrees")
     parser.add_argument("-v", dest="verbose", action='store_true',
                        help="Increase verbosity")
     args = parser.parse_args()
@@ -489,10 +570,19 @@ def main():
     else:
         [x,y,z] = interp_pv(traj, args.t_start)[0]
         [lat,lon,h] = coord.wgsecef2llh(x,y,z)
+        gpst = gpst0 + timedelta(seconds=args.t_start)
         print "Finding satellites visible above %.2f, %.2f, %.0f on %s" % (
             np.degrees(lat), np.degrees(lon), h,
-            gpst0 + timedelta(seconds=args.t_start))
-        prns = peregrine.warm_start.whatsup(ephems, [x,y,z], gpst0, mask=10)
+            gpst)
+        prns = peregrine.warm_start.whatsup(ephems, [x,y,z], gpst, mask=args.mask)
+        [x,y,z] = interp_pv(traj, args.t_start + args.t_run)[0]
+        [lat,lon,h] = coord.wgsecef2llh(x,y,z)
+        gpst += timedelta(seconds=args.t_run)
+        print "..and satellites visible above %.2f, %.2f, %.0f on %s" % (
+            np.degrees(lat), np.degrees(lon), h,
+            gpst)
+        prns += peregrine.warm_start.whatsup(ephems, [x,y,z], gpst, mask=args.mask)
+        prns = list(set(prns))
     print "Using PRNs:", [p + 1 for p in prns]
     for prn in prns:
 	wk, tow = datetime_to_tow(gpst0)
@@ -500,11 +590,30 @@ def main():
         az, el = coord.wgsecef2azel(pos, interp_pv(traj, args.t_start)[0])
 	print "PRN%02d: Az=%.0f, El=%.0f" % (prn+1, np.degrees(az), np.degrees(el))
 
-    print "Generating samples..."
+
+    blackout = None
+    if args.blackout:
+        blackout_spec = args.blackout.split(',')
+        if len(blackout_spec) < 2 or len(blackout_spec) > 4:
+            print "Invalid blackout spec."
+            return 1
+        blackout_start = float(blackout_spec[0])
+        blackout_dur = float(blackout_spec[1])
+        if len(blackout_spec) >= 3:
+            blackout_fade = float(blackout_spec[2])
+        else:
+            blackout_fade = 10.0
+        if len(blackout_spec) >= 4:
+            blackout_level = float(blackout_spec[3])
+        else:
+            blackout_level = 0
+        blackout = (blackout_start, blackout_dur, blackout_fade, blackout_level)
+
     s = gen_signal(ephems, traj, gpst0, repair_unsmooth=args.repair,
-                   t_run=args.t_run, t_skip=args.t_start, t_step=args.t_step,
-                   fs=args.fs, fi=args.fi, prns=prns,
-                   multipath_spec=(multipath_n, multipath_x, multipath_y))
+                    t_run=args.t_run, t_skip=args.t_start, t_step=args.t_step,
+                    fs=args.fs, fi=args.fi, prns=prns,
+                    multipath_spec=(multipath_n, multipath_x, multipath_y),
+                    blackout_spec=blackout, antenna=args.antenna, elev_mask = args.mask)
     
     if args.noise:
         print "Adding noise..."
@@ -512,6 +621,10 @@ def main():
 
     print "Writing output..."
     peregrine.samples.save_samples(args.outfile, s, file_format=args.outformat)
+    #with open(args.outfile, 'wb') as f:
+    #    for s in ss:
+    #        np.array(s).tofile(f)
+    
     print "Saved", args.outfile
 
 if __name__ == "__main__":
