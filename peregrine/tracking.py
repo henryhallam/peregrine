@@ -209,28 +209,39 @@ def track(samples, channels,
       E = 0+0.j; P = 0+0.j; L = 0+0.j
 
       if stage1 and stage2_coherent_ms and track_result.nav_msg.bit_phase == track_result.nav_msg.bit_phase_ref:
-        #print "PRN %02d transition to stage 2 at %d ms" % (chan.prn+1, ms_tracked)
+        print "PRN %02d transition to stage 2 at %d ms" % (chan.prn+1, ms_tracked)
         stage1 = False
         loop_filter.retune(*stage2_loop_filter_params)
         cn0_est = swiftnav.track.CN0Estimator(1e3/stage2_coherent_ms,
                                               track_result.cn0[i-1], 10,
                                               1e3/stage2_coherent_ms)
+        # hacks to examine open code loop behavior
+        #code_phase += 0.125
+        
 
       coherent_ms = 1 if stage1 else stage2_coherent_ms
       
       for j in range(coherent_ms):
         samples_ = samples[sample_index:]
 
+        # hacks to examine open code loop behavior
+        if stage1:
+          code_freq = loop_filter.code_freq + chipping_rate
+        else:
+          code_freq = chipping_rate
+        
         E_, P_, L_, blksize, code_phase, carr_phase = correlator(
           samples_,
-          loop_filter.code_freq + chipping_rate, code_phase,
+          code_freq, code_phase,
           loop_filter.carr_freq + IF, carr_phase,
           ca_code,
           sampling_freq
         )
+        if (blksize != 16368):
+          print ms_tracked * 1e-3, blksize
         sample_index += blksize
         carr_phase_acc += loop_filter.carr_freq * blksize / sampling_freq
-        code_phase_acc += loop_filter.code_freq * blksize / sampling_freq
+        code_phase_acc += code_freq * blksize / sampling_freq
 
         E += E_; P += P_; L += L_
 
