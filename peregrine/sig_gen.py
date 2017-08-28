@@ -161,7 +161,7 @@ def interp_traj(traj, t0, t_run, t_skip=0, t_step=0.002, fs=16.368e6, smoothify=
     return step_t, step_tow, step_pv, step_samps
 
 def gen_signal_sat_los(t0, x0, v, n_samples, fs, fi, cacode, nav_msg, nav_msg_tow0, jitter=0):
-    t = t0 + np.arange(n_samples, dtype=np.float32) / fs # + np.random.normal(size=n_samples)*jitter
+    t = t0 + np.arange(n_samples) / fs # + np.random.normal(size=n_samples)*jitter
     x = x0 + (t-t0) * v
     carrier_phase = 2 * gps.pi * ((fi * t) - (x / (gps.c / gps.l1)))
     code_phase = np.asarray((t * gps.chip_rate) - x / (gps.c / gps.chip_rate), np.int64)
@@ -193,7 +193,7 @@ def sat_los(tow, pv, ephem):
     v = np.dot(gps_v - pv[1], line_of_sight) / los_range + clock_rate_err * gps.c
     return x, v
 
-def gen_nav_msg(ephem, tow0, n_subframes=5*25):
+def gen_nav_msg(ephem, tow0, n_subframes=3*5*25):
     def parity32(x):
         x ^= x >> 16
         x ^= x >> 8
@@ -434,7 +434,7 @@ def gen_signal(ephems, traj,
     cacodes = {prn:  np.array(gencode.generateCAcode(prn)) for prn in prns}
 #    nav_msgs = {prn: None for prn in prns}
 #    cacodes = {prn: np.ones(1023) for prn in prns}
-    chunk_len = 10
+    chunk_len = 100
     def gen_chunk(i, n):
         ss = []
         for ix in range(i, i + n):
@@ -459,16 +459,13 @@ def gen_signal(ephems, traj,
             sp = map(lambda prn: gen_signal_step_sat(prn), step_prn_snrs[ix].keys())
             s = np.sum(sp,0)# + np.random.normal(size=step_samps)
             s = np.int8(s * scale)
-            if i == 0:
-                print s
             ss.append(s)
         return np.concatenate(ss)
     
     print "Generating samples..."
     sss = pp.parmap(lambda i: gen_chunk(i, min(chunk_len, len(step_t)-i)),
                     range(0, len(step_t), chunk_len))
-    return np.concatenate(sss)
-#    return sss
+    return sss
 
 
 def add_noise(s, level):
@@ -609,7 +606,7 @@ def main():
             blackout_level = 0
         blackout = (blackout_start, blackout_dur, blackout_fade, blackout_level)
 
-    s = gen_signal(ephems, traj, gpst0, repair_unsmooth=args.repair,
+    ss = gen_signal(ephems, traj, gpst0, repair_unsmooth=args.repair,
                     t_run=args.t_run, t_skip=args.t_start, t_step=args.t_step,
                     fs=args.fs, fi=args.fi, prns=prns,
                     multipath_spec=(multipath_n, multipath_x, multipath_y),
@@ -620,10 +617,10 @@ def main():
         add_noise(s, args.noise)
 
     print "Writing output..."
-    peregrine.samples.save_samples(args.outfile, s, file_format=args.outformat)
-    #with open(args.outfile, 'wb') as f:
-    #    for s in ss:
-    #        np.array(s).tofile(f)
+    #peregrine.samples.save_samples(args.outfile, s, file_format=args.outformat)
+    with open(args.outfile, 'wb') as f:
+        for s in ss:
+            np.array(s).tofile(f)
     
     print "Saved", args.outfile
 
